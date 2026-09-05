@@ -51,13 +51,11 @@ pub const ConfigError = error{
 
 /// Error set for the OTLP Export operation.
 pub const ExportError = error{
-    /// The transport accepted the request and is retrying it asynchronously
-    /// (e.g. on a detached background thread). The caller should treat this
-    /// as "in flight" and not retry itself.
-    RequestEnqueuedForRetry,
-    /// The server returned a retryable status, but the transport did not take
-    /// ownership of the retry. The caller may retry at its discretion.
+    /// The server returned a retryable status after the configured retry budget.
     RetryableStatusCodeInResponse,
+    /// Deprecated compatibility value. Retries are now owned by the export call
+    /// and are never left running asynchronously.
+    RequestEnqueuedForRetry,
     UnimplementedTransportProtocol,
     NonRetryableStatusCodeInResponse,
 };
@@ -669,12 +667,13 @@ const HTTPClient = struct {
             .location = .{ .url = url },
             // We always send a POST request to write OTLP data.
             .method = .POST,
+            .keep_alive = false,
             .headers = req_opts.headers,
             .extra_headers = if (req_opts.extra_headers.len > 0) req_opts.extra_headers else &.{},
             .payload = req_body,
         };
 
-        const response = self.fetchWithTimeout(fetch_request) catch |err| {
+        var response = self.fetchWithTimeout(fetch_request) catch |err| {
             // Handle connection errors that occur before getting a response
             switch (err) {
                 error.HttpConnectionClosing, error.ReadFailed, error.ConnectionResetByPeer => {
@@ -685,27 +684,29 @@ const HTTPClient = struct {
             }
         };
 
+        var retry_count: u32 = 0;
+        while (isRetryableStatus(response.status)) {
+            if (retry_count == self.config.retryConfig.max_retries)
+                return ExportError.RetryableStatusCodeInResponse;
+
+            clock.sleep(std.time.ns_per_ms * calculateDelayMillisec(
+                self.config.retryConfig.base_delay_ms,
+                self.config.retryConfig.max_delay_ms,
+                retry_count,
+            ));
+            retry_count += 1;
+            response = self.fetchWithTimeout(fetch_request) catch |err| {
+                switch (err) {
+                    error.HttpConnectionClosing, error.ReadFailed, error.ConnectionResetByPeer => return ExportError.NonRetryableStatusCodeInResponse,
+                    else => return err,
+                }
+            };
+        }
+
         switch (response.status) {
             // TODO: handle partial success.
             // See https://opentelemetry.io/docs/specs/otlp/#partial-success-1
             .ok, .accepted => return,
-            // We must handle retries for a subset of status codes.
-            // See https://opentelemetry.io/docs/specs/otlp/#otlphttp-response
-            .too_many_requests, .bad_gateway, .service_unavailable, .gateway_timeout => {
-                // Use page_allocator for retry thread to avoid lifetime issues with the caller's allocator
-                // The retry thread is detached and may outlive the caller's scope
-                const retry_allocator = std.heap.page_allocator;
-                const cloned_req = try cloneFetchOptions(retry_allocator, fetch_request);
-                const t = try std.Thread.spawn(.{}, retryRequest, .{
-                    retry_allocator,
-                    self.client.io,
-                    self.config.retryConfig,
-                    cloned_req,
-                });
-                t.detach();
-
-                return ExportError.RequestEnqueuedForRetry;
-            },
             else => {
                 // Do not retry and report the status code and the message.
                 // TODO implement error handling, parsing Status message.
@@ -715,61 +716,11 @@ const HTTPClient = struct {
         }
     }
 
-    fn retryRequest(allocator: std.mem.Allocator, io: std.Io, retry_config: ExpBackoffconfig, req_opts: http.Client.FetchOptions) void {
-        defer freeFetchOptions(allocator, req_opts);
-
-        var retry_count: u32 = 0;
-        while (retry_count < retry_config.max_retries) {
-            defer retry_count += 1;
-
-            var client = http.Client{ .allocator = allocator, .io = io };
-            const response = client.fetch(req_opts) catch |err| {
-                client.deinit();
-                log.err("transport (retry): error connecting to server: {}", .{err});
-                continue;
-            };
-            client.deinit();
-
-            switch (response.status) {
-                .ok, .accepted => {
-                    return;
-                },
-                .too_many_requests, .bad_gateway, .service_unavailable, .gateway_timeout => {
-                    // This retry runs in a dedicated OS thread (see retryRequest spawn above).
-                    // For Io.Evented users, the spawned thread still blocks the OS thread,
-                    // which is less efficient than an evented delay but correct.
-                    clock.sleep(std.time.ns_per_ms * calculateDelayMillisec(
-                        retry_config.base_delay_ms,
-                        retry_config.max_delay_ms,
-                        retry_count,
-                    ));
-                    continue;
-                },
-                else => |status| {
-                    log.err("transport (retry): request failed with status code: {}", .{status});
-                    return;
-                },
-            }
-        }
-    }
-
-    fn cloneFetchOptions(allocator: std.mem.Allocator, opts: http.Client.FetchOptions) !http.Client.FetchOptions {
-        var cloned = opts;
-        cloned.location = .{ .url = try allocator.dupe(u8, opts.location.url) };
-        if (opts.payload) |payload| {
-            cloned.payload = try allocator.dupe(u8, payload);
-        }
-        cloned.extra_headers = try allocator.dupe(http.Header, opts.extra_headers);
-
-        return cloned;
-    }
-
-    fn freeFetchOptions(allocator: std.mem.Allocator, req: http.Client.FetchOptions) void {
-        allocator.free(req.location.url);
-        if (req.payload) |payload| {
-            allocator.free(payload);
-        }
-        allocator.free(req.extra_headers);
+    fn isRetryableStatus(status: http.Status) bool {
+        return switch (status) {
+            .too_many_requests, .bad_gateway, .service_unavailable, .gateway_timeout => true,
+            else => false,
+        };
     }
 };
 
