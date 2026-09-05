@@ -237,8 +237,10 @@ pub const ConfigOptions = struct {
 
     retryConfig: ExpBackoffconfig = .{},
 
-    // Tracks whether `endpoint` was allocated by us and must be freed on deinit.
-    endpoint_owned: bool = false,
+    // Keeps environment-derived endpoint storage separate from the public slice.
+    // Callers may replace `endpoint` directly, so deinit must never infer ownership
+    // from the current slice value.
+    owned_endpoint: ?[]u8 = null,
 
     pub fn init(allocator: std.mem.Allocator, env_map: *const EnvMap) !*ConfigOptions {
         const s = try allocator.create(ConfigOptions);
@@ -251,7 +253,7 @@ pub const ConfigOptions = struct {
     }
 
     pub fn deinit(self: *ConfigOptions) void {
-        if (self.endpoint_owned) self.allocator.free(self.endpoint);
+        if (self.owned_endpoint) |endpoint| self.allocator.free(endpoint);
         var it = self.custom_signal_urls.valueIterator();
         while (it.next()) |v| self.allocator.free(v.*);
         self.custom_signal_urls.deinit(self.allocator);
@@ -319,9 +321,9 @@ pub const ConfigOptions = struct {
         }
         if (value.len == 0) return ConfigError.InvalidEndpoint;
         const owned = try self.allocator.dupe(u8, value);
-        if (self.endpoint_owned) self.allocator.free(self.endpoint);
+        if (self.owned_endpoint) |previous| self.allocator.free(previous);
+        self.owned_endpoint = owned;
         self.endpoint = owned;
-        self.endpoint_owned = true;
     }
 
     fn entryFromEnvMap(environ: *const EnvMap, varSuffix: []const u8) ?[]const u8 {
@@ -447,6 +449,17 @@ test "otlp config from env with URL scheme in endpoint" {
 
         try std.testing.expectError(ConfigError.InvalidEndpoint, ConfigOptions.init(allocator, &map));
     }
+}
+
+test "otlp config deinit preserves ownership after endpoint override" {
+    const allocator = std.testing.allocator;
+    var map = EnvMap.init(allocator);
+    defer map.deinit();
+    try map.put("OTEL_EXPORTER_OTLP_ENDPOINT", "http://environment.example:4318");
+
+    var config = try ConfigOptions.init(allocator, &map);
+    config.endpoint = "localhost:14318";
+    config.deinit();
 }
 
 test "otlp config custom endpoint for singals" {
