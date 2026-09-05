@@ -607,6 +607,44 @@ const HTTPClient = struct {
         return request_options;
     }
 
+    const FetchOutcome = union(enum) {
+        response: anyerror!http.Client.FetchResult,
+        timeout: void,
+    };
+
+    const FetchContext = struct {
+        client: *http.Client,
+        options: http.Client.FetchOptions,
+    };
+
+    fn fetchRequest(context: FetchContext) anyerror!http.Client.FetchResult {
+        return context.client.fetch(context.options);
+    }
+
+    fn waitForTimeout(io: std.Io, timeout: std.Io.Timeout) void {
+        timeout.sleep(io) catch {};
+    }
+
+    fn fetchWithTimeout(self: *Self, options: http.Client.FetchOptions) !http.Client.FetchResult {
+        var results: [2]FetchOutcome = undefined;
+        var select = std.Io.Select(FetchOutcome).init(self.client.io, &results);
+        defer select.cancelDiscard();
+
+        try select.concurrent(.response, fetchRequest, .{FetchContext{
+            .client = &self.client,
+            .options = options,
+        }});
+        select.async(.timeout, waitForTimeout, .{ self.client.io, .{ .duration = .{
+            .raw = std.Io.Duration.fromSeconds(@intCast(self.config.timeout_sec)),
+            .clock = .awake,
+        } } });
+
+        return switch (try select.await()) {
+            .response => |response| response,
+            .timeout => error.Timeout,
+        };
+    }
+
     // Send the OTLP data to the url using the client's configuration.
     // Data passed as argument should either be protobuf or JSON encoded, as specified in the config.
     // Data will be compressed here.
@@ -636,7 +674,7 @@ const HTTPClient = struct {
             .payload = req_body,
         };
 
-        const response = self.client.fetch(fetch_request) catch |err| {
+        const response = self.fetchWithTimeout(fetch_request) catch |err| {
             // Handle connection errors that occur before getting a response
             switch (err) {
                 error.HttpConnectionClosing, error.ReadFailed, error.ConnectionResetByPeer => {
