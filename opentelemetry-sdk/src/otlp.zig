@@ -643,10 +643,73 @@ const HTTPClient = struct {
         };
     }
 
+    fn reportPartialSuccess(self: *Self, signal: Signal, body: []const u8) !void {
+        if (body.len == 0) return;
+
+        switch (self.config.protocol) {
+            .http_protobuf => {
+                var reader = std.Io.Reader.fixed(body);
+                switch (signal) {
+                    .metrics => {
+                        var response = try pbcollector_metrics.ExportMetricsServiceResponse.decode(&reader, self.allocator);
+                        defer response.deinit(self.allocator);
+                        if (response.partial_success) |partial| {
+                            if (partial.rejected_data_points != 0)
+                                log.warn("OTLP partial success signal={s} rejected_data_points={} message={s}", .{ @tagName(signal), partial.rejected_data_points, partial.error_message });
+                        }
+                    },
+                    .logs => {
+                        var response = try pbcollector_logs.ExportLogsServiceResponse.decode(&reader, self.allocator);
+                        defer response.deinit(self.allocator);
+                        if (response.partial_success) |partial| {
+                            if (partial.rejected_log_records != 0)
+                                log.warn("OTLP partial success signal={s} rejected_log_records={} message={s}", .{ @tagName(signal), partial.rejected_log_records, partial.error_message });
+                        }
+                    },
+                    .traces => {
+                        var response = try pbcollector_trace.ExportTraceServiceResponse.decode(&reader, self.allocator);
+                        defer response.deinit(self.allocator);
+                        if (response.partial_success) |partial| {
+                            if (partial.rejected_spans != 0)
+                                log.warn("OTLP partial success signal={s} rejected_spans={} message={s}", .{ @tagName(signal), partial.rejected_spans, partial.error_message });
+                        }
+                    },
+                }
+            },
+            .http_json => switch (signal) {
+                .metrics => {
+                    var parsed = try pbcollector_metrics.ExportMetricsServiceResponse.jsonDecode(body, .{}, self.allocator);
+                    defer parsed.deinit();
+                    if (parsed.value.partial_success) |partial| {
+                        if (partial.rejected_data_points != 0)
+                            log.warn("OTLP partial success signal={s} rejected_data_points={} message={s}", .{ @tagName(signal), partial.rejected_data_points, partial.error_message });
+                    }
+                },
+                .logs => {
+                    var parsed = try pbcollector_logs.ExportLogsServiceResponse.jsonDecode(body, .{}, self.allocator);
+                    defer parsed.deinit();
+                    if (parsed.value.partial_success) |partial| {
+                        if (partial.rejected_log_records != 0)
+                            log.warn("OTLP partial success signal={s} rejected_log_records={} message={s}", .{ @tagName(signal), partial.rejected_log_records, partial.error_message });
+                    }
+                },
+                .traces => {
+                    var parsed = try pbcollector_trace.ExportTraceServiceResponse.jsonDecode(body, .{}, self.allocator);
+                    defer parsed.deinit();
+                    if (parsed.value.partial_success) |partial| {
+                        if (partial.rejected_spans != 0)
+                            log.warn("OTLP partial success signal={s} rejected_spans={} message={s}", .{ @tagName(signal), partial.rejected_spans, partial.error_message });
+                    }
+                },
+            },
+            .grpc => unreachable,
+        }
+    }
+
     // Send the OTLP data to the url using the client's configuration.
     // Data passed as argument should either be protobuf or JSON encoded, as specified in the config.
     // Data will be compressed here.
-    fn send(self: *Self, url: []const u8, input_data: []const u8) !void {
+    fn send(self: *Self, signal: Signal, url: []const u8, input_data: []const u8) !void {
         const req_body = req: {
             switch (self.config.compression) {
                 .none => break :req try self.allocator.dupe(u8, input_data),
@@ -663,6 +726,9 @@ const HTTPClient = struct {
             if (req_opts.extra_headers.len > 0) self.allocator.free(req_opts.extra_headers);
         }
 
+        var response_body = std.Io.Writer.Allocating.init(self.allocator);
+        defer response_body.deinit();
+
         const fetch_request = http.Client.FetchOptions{
             .location = .{ .url = url },
             // We always send a POST request to write OTLP data.
@@ -671,6 +737,7 @@ const HTTPClient = struct {
             .headers = req_opts.headers,
             .extra_headers = if (req_opts.extra_headers.len > 0) req_opts.extra_headers else &.{},
             .payload = req_body,
+            .response_writer = &response_body.writer,
         };
 
         var response = self.fetchWithTimeout(fetch_request) catch |err| {
@@ -695,6 +762,7 @@ const HTTPClient = struct {
                 retry_count,
             ));
             retry_count += 1;
+            response_body.clearRetainingCapacity();
             response = self.fetchWithTimeout(fetch_request) catch |err| {
                 switch (err) {
                     error.HttpConnectionClosing, error.ReadFailed, error.ConnectionResetByPeer => return ExportError.NonRetryableStatusCodeInResponse,
@@ -704,9 +772,12 @@ const HTTPClient = struct {
         }
 
         switch (response.status) {
-            // TODO: handle partial success.
-            // See https://opentelemetry.io/docs/specs/otlp/#partial-success-1
-            .ok, .accepted => return,
+            .ok, .accepted => {
+                self.reportPartialSuccess(signal, response_body.written()) catch |err| {
+                    log.warn("parse OTLP partial-success response: {t}", .{err});
+                };
+                return;
+            },
             else => {
                 // Do not retry and report the status code and the message.
                 // TODO implement error handling, parsing Status message.
@@ -867,7 +938,7 @@ test "otlp HTTPClient send fails for missing server" {
     defer allocator.free(url);
 
     var payload = [_]u8{0} ** 1024;
-    const result = client.send(url, &payload);
+    const result = client.send(.metrics, url, &payload);
     try std.testing.expectError(error.ConnectionRefused, result);
 }
 
@@ -893,7 +964,7 @@ pub fn Export(
             const url = try config.httpUrlForSignal(otlp_payload.signal(), allocator);
             defer allocator.free(url);
 
-            break :blk http_client.send(url, payload);
+            break :blk http_client.send(otlp_payload.signal(), url, payload);
         },
         .grpc => grpc_transport.send(allocator, otlp_payload.signal().grpcPath(), payload, .{
             .endpoint = config.endpoint,
