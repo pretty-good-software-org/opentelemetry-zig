@@ -112,6 +112,53 @@ test "otlp HTTPClient enforces HTTP timeout" {
     try std.testing.expectError(error.Timeout, result);
 }
 
+test "otlp HTTPClient accepts and parses partial success" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var server = try HTTPTestServer.init(allocator, io, metricsPartialSuccess);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, HTTPTestServer.processSingleRequest, .{server});
+    defer thread.join();
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    const config = try ConfigOptions.init(allocator, &env_map);
+    defer config.deinit();
+    const endpoint = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{server.port()});
+    defer allocator.free(endpoint);
+    config.endpoint = endpoint;
+
+    var dummy = try emptyMetricsExportRequest(allocator);
+    defer dummy.deinit(allocator);
+
+    try otlp.Export(allocator, io, config, otlp.Signal.Data{ .metrics = dummy });
+}
+
+test "otlp HTTPClient accepts JSON partial success" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var server = try HTTPTestServer.init(allocator, io, metricsPartialSuccessJSON);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, HTTPTestServer.processSingleRequest, .{server});
+    defer thread.join();
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    const config = try ConfigOptions.init(allocator, &env_map);
+    defer config.deinit();
+    config.protocol = .http_json;
+    const endpoint = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{server.port()});
+    defer allocator.free(endpoint);
+    config.endpoint = endpoint;
+
+    var dummy = try emptyMetricsExportRequest(allocator);
+    defer dummy.deinit(allocator);
+
+    try otlp.Export(allocator, io, config, otlp.Signal.Data{ .metrics = dummy });
+}
+
 test "otlp HTTPClient uncompressed protobuf metrics payload" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -343,6 +390,25 @@ fn badRequest(request: *http.Server.Request) anyerror!void {
 
 fn tooManyRequests(request: *http.Server.Request) anyerror!void {
     try request.respond("", .{ .status = .too_many_requests });
+}
+
+fn metricsPartialSuccess(request: *http.Server.Request) anyerror!void {
+    var writer = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer writer.deinit();
+    const response = pbcollector_metrics.ExportMetricsServiceResponse{
+        .partial_success = .{ .rejected_data_points = 2 },
+    };
+    try response.encode(&writer.writer, std.testing.allocator);
+    try request.respond(writer.written(), .{ .status = .ok });
+}
+
+fn metricsPartialSuccessJSON(request: *http.Server.Request) anyerror!void {
+    const response = pbcollector_metrics.ExportMetricsServiceResponse{
+        .partial_success = .{ .rejected_data_points = 2 },
+    };
+    const body = try response.jsonEncode(.{}, .{}, std.testing.allocator);
+    defer std.testing.allocator.free(body);
+    try request.respond(body, .{ .status = .ok });
 }
 
 fn delayedSuccess(request: *http.Server.Request) anyerror!void {
