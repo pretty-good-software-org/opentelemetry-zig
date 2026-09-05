@@ -93,6 +93,31 @@ test "otlp HTTPClient send retries on retryable error" {
     try std.testing.expectEqual(max_requests, req_counter.load(.acquire));
 }
 
+test "otlp HTTPClient enforces HTTP timeout" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var server = try HTTPTestServer.init(allocator, io, delayedSuccess);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, HTTPTestServer.processSingleRequest, .{server});
+    defer thread.join();
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    const config = try ConfigOptions.init(allocator, &env_map);
+    defer config.deinit();
+    config.timeout_sec = 1;
+    const endpoint = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{server.port()});
+    defer allocator.free(endpoint);
+    config.endpoint = endpoint;
+
+    var dummy = try emptyMetricsExportRequest(allocator);
+    defer dummy.deinit(allocator);
+
+    const result = otlp.Export(allocator, io, config, otlp.Signal.Data{ .metrics = dummy });
+    try std.testing.expectError(error.Timeout, result);
+}
+
 test "otlp HTTPClient uncompressed protobuf metrics payload" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -324,6 +349,11 @@ fn badRequest(request: *http.Server.Request) anyerror!void {
 
 fn tooManyRequests(request: *http.Server.Request) anyerror!void {
     try request.respond("", .{ .status = .too_many_requests });
+}
+
+fn delayedSuccess(request: *http.Server.Request) anyerror!void {
+    clock.sleep(2 * std.time.ns_per_s);
+    try request.respond("", .{ .status = .ok });
 }
 
 fn assertUncompressedJsonMetricsBodyCanBeParsed(request: *http.Server.Request) anyerror!void {
