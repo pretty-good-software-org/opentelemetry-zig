@@ -80,17 +80,11 @@ test "otlp HTTPClient send retries on retryable error" {
     defer dummy.deinit(std.testing.allocator);
 
     const result = otlp.Export(allocator, io, config, otlp.Signal.Data{ .metrics = dummy });
-    // Assert that we did all the expected requests
-    try std.testing.expectError(otlp.ExportError.RequestEnqueuedForRetry, result);
+    // Retries are owned by Export and complete before it returns.
+    try std.testing.expectError(otlp.ExportError.RetryableStatusCodeInResponse, result);
+    try std.testing.expectEqual(max_requests, req_counter.load(.acquire));
 
     thread.join();
-
-    // Give the detached retry thread time to finish before the test tears down `threaded`.
-    clock.sleep(std.time.ns_per_ms * 10);
-
-    // Eventually the non-retryable status code is returned, and we should have received
-    // the maximum number of requests.
-    try std.testing.expectEqual(max_requests, req_counter.load(.acquire));
 }
 
 test "otlp HTTPClient enforces HTTP timeout" {
